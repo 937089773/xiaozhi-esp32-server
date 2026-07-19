@@ -41,6 +41,18 @@ server:
   mqtt_signature_key: null
   # UDP网关配置
   udp_gateway: null
+mqtt_transport:
+  enabled: false
+  endpoint: "xxx.emqxsl.com"
+  port: 8883
+  username: "server-user"
+  password: "server-password"
+  client_id: "xiaozhi-server"
+  topic_prefix: "xiaozhi/device"
+  tls: true
+  qos:
+    json: 1
+    audio: 0
 log:
   # 设置控制台输出的日志格式，时间、日志级别、标签、消息
   log_format: "<green>{time:YYMMDD HH:mm:ss}</green>[{version}_{selected_module}][<light-blue>{extra[tag]}</light-blue>]-<level>{level}</level>-<light-green>{message}</light-green>"

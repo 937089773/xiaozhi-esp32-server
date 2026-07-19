@@ -225,7 +225,7 @@ class ConnectionHandler:
 
             # 检查是否来自MQTT连接
             request_path = ws.request.path
-            self.conn_from_mqtt_gateway = request_path.endswith("?from=mqtt_gateway")
+            self.conn_from_mqtt_gateway = request_path.endswith("?from=mqtt_gateway") or "from=mqtt_transport" in request_path
             if self.conn_from_mqtt_gateway:
                 self.logger.bind(tag=TAG).info("连接来自:MQTT网关")
 
