@@ -43,7 +43,7 @@ server:
   udp_gateway: null
 mqtt_transport:
   enabled: false
-  endpoint: "xxx.emqxsl.com"
+  endpoint: "p956331a.ala.cn-hangzhou.emqxsl.cn"
   port: 8883
   username: "server-user"
   password: "server-password"

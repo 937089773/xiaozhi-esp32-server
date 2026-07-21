@@ -2,6 +2,7 @@ import sys
 import uuid
 import signal
 import asyncio
+import inspect
 from aioconsole import ainput
 from config.settings import load_config
 from config.logger import setup_logging
@@ -46,7 +47,9 @@ async def monitor_stdin():
 
 async def main():
     check_ffmpeg_installed()
-    config = await load_config()
+    config = load_config()
+    if inspect.isawaitable(config):
+        config = await config
 
     # auth_key优先级：配置文件server.auth_key > manager-api.secret > 自动生成
     # auth_key用于jwt认证，比如视觉分析接口的jwt认证、ota接口的token生成与websocket认证

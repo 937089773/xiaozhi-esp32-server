@@ -59,6 +59,7 @@ class MqttTransport:
             self.client.tls_set()
 
         self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
         self.client.connect(self.transport_config["endpoint"], int(self.transport_config.get("port", 8883)), keepalive=60)
         self.client.loop_start()
@@ -106,9 +107,14 @@ class MqttTransport:
         await handler.handle_connection(websocket)
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        self._logger().bind(tag=TAG).info("MQTT transport connected: {}", reason_code)
         client.subscribe(f"{self.topic_prefix}/+/up/json", qos=self.json_qos)
         client.subscribe(f"{self.topic_prefix}/+/up/audio", qos=self.audio_qos)
         client.subscribe(f"{self.topic_prefix}/+/status", qos=self.json_qos)
+
+    def _on_disconnect(self, client, userdata, *args):
+        reason_code = args[-2] if len(args) >= 2 else (args[0] if args else None)
+        self._logger().bind(tag=TAG).warning("MQTT transport disconnected: {}", reason_code)
 
     def _on_message(self, client, userdata, message):
         if self.loop is not None:
