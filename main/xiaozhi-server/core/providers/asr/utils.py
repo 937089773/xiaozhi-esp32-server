@@ -77,3 +77,11 @@ def lang_tag_filter(text: str) -> dict | str:
 
     return result
 
+
+def asr_text_content(text: dict | str | None) -> str:
+    if isinstance(text, dict):
+        return str(text.get("content", ""))
+    if text is None:
+        return ""
+    return str(text)
+

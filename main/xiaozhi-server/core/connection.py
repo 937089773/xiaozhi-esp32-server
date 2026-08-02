@@ -239,7 +239,9 @@ class ConnectionHandler:
             # 启动AEC缓存清理任务
             self._aec_cache_cleanup_task = asyncio.create_task(self._check_aec_cache_expiry())
 
-            self.welcome_msg = self.config["xiaozhi"]
+            self.welcome_msg = copy.deepcopy(self.config["xiaozhi"])
+            if self.conn_from_mqtt_gateway:
+                self.welcome_msg["transport"] = "mqtt"
             self.welcome_msg["session_id"] = self.session_id
 
             # 从配置中读取采样率
@@ -1031,6 +1033,29 @@ class ConnectionHandler:
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 
+    async def _send_llm_text_message(self, text):
+        if not text or not text.strip() or self.websocket is None:
+            return
+        message = {
+            "type": "llm",
+            "session_id": self.session_id,
+            "text": textUtils.check_emoji(text),
+        }
+        self.logger.bind(tag=TAG).info(f"发送模型文本到客户端: {message['text']}")
+        await self.websocket.send(json.dumps(message, ensure_ascii=False))
+
+    def _queue_llm_text_message(self, text):
+        if not text or not text.strip() or self.websocket is None or self.loop is None:
+            return
+        future = asyncio.run_coroutine_threadsafe(self._send_llm_text_message(text), self.loop)
+        future.add_done_callback(self._log_llm_text_send_result)
+
+    def _log_llm_text_send_result(self, future):
+        try:
+            future.result()
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"发送模型文本到客户端失败: {e}")
+
     def chat(self, query, depth=0):
         # 保存当前任务的sentence_id到局部变量，避免被新任务覆盖
         current_sentence_id = None
@@ -1276,6 +1301,7 @@ class ConnectionHandler:
                             da_response = self._clean_response_garbage(da_response)
                             self.tts.store_tts_text(current_sentence_id, da_response)
                             self.dialogue.put(Message(role="assistant", content=da_response))
+                            self._queue_llm_text_message(da_response)
 
                     if not real_tool_calls:
                         if depth == 0:
@@ -1301,6 +1327,7 @@ class ConnectionHandler:
                     streamed_text = "".join(response_message)
                     self.tts.store_tts_text(current_sentence_id, streamed_text)
                     self.dialogue.put(Message(role="assistant", content=streamed_text))
+                    self._queue_llm_text_message(streamed_text)
                 response_message.clear()
 
                 # 收集所有工具调用的 Future
@@ -1355,6 +1382,10 @@ class ConnectionHandler:
             text_buff = "".join(response_message)
             self.tts.store_tts_text(current_sentence_id, text_buff)
             self.dialogue.put(Message(role="assistant", content=text_buff))
+            self._queue_llm_text_message(text_buff)
+        elif not tool_call_flag:
+            self.logger.bind(tag=TAG).warning("大模型没有返回可显示文本")
+            self._queue_llm_text_message("模型没有返回文本")
 
         if depth == 0:
             self.tts.tts_text_queue.put(
@@ -1392,6 +1423,7 @@ class ConnectionHandler:
                     self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail=text)
                     self.tts.store_tts_text(self.sentence_id, text)
                 self.dialogue.put(Message(role="assistant", content=text))
+                self._queue_llm_text_message(text)
             elif result.action == Action.REQLLM:
                 need_llm_tools.append((result, tool_call_data))
             elif result.action == Action.RECORD:

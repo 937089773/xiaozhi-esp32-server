@@ -1,4 +1,6 @@
 import asyncio
+import struct
+import time
 from types import SimpleNamespace
 
 
@@ -35,6 +37,7 @@ class MqttTransportConnection:
         )
         self.closed = False
         self._incoming = asyncio.Queue()
+        self._audio_sequence = 0
 
     def __aiter__(self):
         return self
@@ -47,7 +50,8 @@ class MqttTransportConnection:
 
     async def send(self, payload):
         if isinstance(payload, bytes):
-            self.client.publish(self.topics["down_audio"], payload, qos=self.audio_qos)
+            audio_payload = payload if self._valid_audio_packet(payload) and len(payload) >= 16 and payload[0] == 1 else self._pack_audio(payload)
+            self.client.publish(self.topics["down_audio"], audio_payload, qos=self.audio_qos)
         else:
             self.client.publish(self.topics["down_json"], payload, qos=self.json_qos)
 
@@ -60,4 +64,19 @@ class MqttTransportConnection:
         await self._incoming.put(payload)
 
     async def receive_audio(self, payload: bytes):
-        await self._incoming.put(payload)
+        if self._valid_audio_packet(payload):
+            await self._incoming.put(payload)
+
+    def _pack_audio(self, payload: bytes) -> bytes:
+        self._audio_sequence += 1
+        timestamp = int(time.time() * 1000) & 0xFFFFFFFF
+        header = b"\x01\x00" + struct.pack("!HIII", len(payload), self._audio_sequence, timestamp, len(payload))
+        return header + payload
+
+    def _valid_audio_packet(self, payload: bytes) -> bool:
+        if len(payload) < 16 or payload[0] != 1:
+            return True
+        header_size, _, _, opus_size = struct.unpack("!HIII", payload[2:16])
+        if header_size != opus_size or len(payload) < 16 + opus_size:
+            return False
+        return True

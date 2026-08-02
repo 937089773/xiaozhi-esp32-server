@@ -1,4 +1,5 @@
 import asyncio
+import struct
 
 from core.transports.mqtt_connection import MqttTransportConnection, build_device_topics
 
@@ -38,8 +39,42 @@ def test_send_routes_bytes_to_down_audio_with_audio_qos():
     client = FakeMqttClient()
     conn = MqttTransportConnection("device-001", client, "xiaozhi/device", json_qos=1, audio_qos=0)
 
-    asyncio.run(conn.send(b"\x01opus"))
+    asyncio.run(conn.send(b"opus"))
 
-    assert client.published == [
-        ("xiaozhi/device/device-001/down/audio", b"\x01opus", 0)
-    ]
+    topic, payload, qos = client.published[0]
+    assert topic == "xiaozhi/device/device-001/down/audio"
+    assert qos == 0
+    assert payload[:2] == b"\x01\x00"
+    assert struct.unpack("!H", payload[2:4])[0] == 4
+    assert struct.unpack("!I", payload[12:16])[0] == 4
+    assert payload[16:] == b"opus"
+
+
+def test_send_preserves_already_packed_down_audio():
+    client = FakeMqttClient()
+    conn = MqttTransportConnection("device-001", client, "xiaozhi/device", json_qos=1, audio_qos=0)
+    packet = b"\x01\x00" + struct.pack("!HIII", 4, 1, 123, 4) + b"opus"
+
+    asyncio.run(conn.send(packet))
+
+    topic, payload, qos = client.published[0]
+    assert topic == "xiaozhi/device/device-001/down/audio"
+    assert qos == 0
+    assert payload == packet
+
+
+def test_request_path_marks_mqtt_transport_connection():
+    conn = MqttTransportConnection("device-001", FakeMqttClient(), "xiaozhi/device")
+
+    assert "from=mqtt_transport" in conn.request.path
+
+
+def test_receive_audio_preserves_mqtt_transport_header():
+    conn = MqttTransportConnection("device-001", FakeMqttClient(), "xiaozhi/device")
+    packet = b"\x01\x00" + struct.pack("!HIII", 4, 1, 123, 4) + b"opus"
+
+    async def receive_once():
+        await conn.receive_audio(packet)
+        return await conn.__anext__()
+
+    assert asyncio.run(receive_once()) == packet
