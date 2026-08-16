@@ -69,7 +69,7 @@ def test_send_routes_bytes_to_down_audio_with_default_audio_qos():
 
     topic, payload, qos = client.published[0]
     assert topic == "xiaozhi/device/device-001/down/audio"
-    assert qos == 1
+    assert qos == 0
     assert payload[16:] == b"opus"
 
 
@@ -77,6 +77,20 @@ def test_send_preserves_already_packed_down_audio():
     client = FakeMqttClient()
     conn = MqttTransportConnection("device-001", client, "xiaozhi/device", json_qos=1, audio_qos=0)
     packet = b"\x01\x00" + struct.pack("!HIII", 4, 1, 123, 4) + b"opus"
+
+    asyncio.run(conn.send(packet))
+
+    topic, payload, qos = client.published[0]
+    assert topic == "xiaozhi/device/device-001/down/audio"
+    assert qos == 0
+    assert payload == packet
+
+
+def test_send_preserves_bundled_down_audio():
+    client = FakeMqttClient()
+    conn = MqttTransportConnection("device-001", client, "xiaozhi/device", json_qos=1, audio_qos=0)
+    body = struct.pack("!H", 4) + b"opus" + struct.pack("!H", 5) + b"opus2"
+    packet = b"\x02\x00" + struct.pack("!HIII", len(body), 7, 123, 2) + body
 
     asyncio.run(conn.send(packet))
 

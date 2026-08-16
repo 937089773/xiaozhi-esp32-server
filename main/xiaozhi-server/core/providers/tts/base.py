@@ -5,6 +5,7 @@ import queue
 import asyncio
 import threading
 import traceback
+import time
 import concurrent.futures
 
 from core.utils import p3
@@ -38,6 +39,7 @@ class TTSProviderBase(ABC):
         self.audio_file_type = "wav"
         self.output_file = config.get("output_dir", "tmp/")
         self.tts_timeout = int(config.get("tts_timeout", 15))
+        self.tts_max_retries = max(1, int(config.get("tts_max_retries", 2)))
         self.tts_text_queue = queue.Queue()
         self.tts_audio_queue = queue.Queue()
         self.tts_audio_first_sentence = True
@@ -106,6 +108,56 @@ class TTSProviderBase(ABC):
         self.tts_stop_request = False
         self.processed_chars = 0
         self.is_first_sentence = True
+        self.mqtt_tts_parallel_enabled = bool(
+            config.get("mqtt_tts_parallel_enabled", True)
+        )
+        self.mqtt_tts_parallel_workers = max(
+            1, min(4, int(config.get("mqtt_tts_parallel_workers", 2)))
+        )
+        self.mqtt_tts_parallel_window = max(
+            self.mqtt_tts_parallel_workers,
+            int(
+                config.get(
+                    "mqtt_tts_parallel_window",
+                    self.mqtt_tts_parallel_workers * 2,
+                )
+            ),
+        )
+        self.mqtt_tts_order_timeout = max(
+            1, int(config.get("mqtt_tts_order_timeout", self.tts_timeout))
+        )
+        self.mqtt_tts_min_segment_chars = max(
+            1, int(config.get("mqtt_tts_min_segment_chars", 8))
+        )
+        self.mqtt_tts_split_punctuations = tuple(
+            config.get("mqtt_tts_split_punctuations", "。？！!?；;：，,、~～\n")
+        )
+        self._parallel_executor = None
+        self._parallel_tts_futures = {}
+        self._parallel_tts_meta = {}
+        self._parallel_next_submit_index = 0
+        self._parallel_next_emit_index = 0
+        self._parallel_tts_lock = threading.Lock()
+        self._parallel_tts_emit_lock = threading.Lock()
+
+    def _run_text_to_speak(self, text, output_file):
+        return asyncio.run(
+            asyncio.wait_for(
+                self.text_to_speak(text, output_file),
+                timeout=self.tts_timeout,
+            )
+        )
+
+    def _has_audio_file(self, audio_file):
+        return (
+            audio_file is not None
+            and os.path.exists(audio_file)
+            and os.path.getsize(audio_file) > 0
+        )
+
+    def _remove_audio_file_if_exists(self, audio_file):
+        if audio_file is not None and os.path.exists(audio_file):
+            os.remove(audio_file)
 
     def generate_filename(self, extension=".wav"):
         return os.path.join(
@@ -120,6 +172,247 @@ class TTSProviderBase(ABC):
     def handle_audio_file(self, file_audio: bytes, text):
         self.before_stop_play_files.append((file_audio, text))
 
+    def _make_opus_handler(self, sentence_id):
+        def _handler(opus_data: bytes):
+            logger.bind(tag=TAG).debug(f"推送数据到队列里面帧数～～ {len(opus_data)}")
+            self.tts_audio_queue.put((SentenceType.MIDDLE, opus_data, None, sentence_id))
+
+        return _handler
+
+    def _should_parallelize_tts(self):
+        return (
+            self.conn is not None
+            and self.conn.conn_from_mqtt_gateway
+            and self.interface_type == InterfaceType.NON_STREAM
+            and self.mqtt_tts_parallel_enabled
+            and self.mqtt_tts_parallel_workers > 1
+        )
+
+    def _get_parallel_executor(self):
+        if self._parallel_executor is None:
+            self._parallel_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.mqtt_tts_parallel_workers,
+                thread_name_prefix="mqtt-tts",
+            )
+        return self._parallel_executor
+
+    def _reset_parallel_tts_state(self):
+        with self._parallel_tts_lock:
+            for future in self._parallel_tts_futures.values():
+                future.cancel()
+            self._parallel_tts_futures = {}
+            self._parallel_tts_meta = {}
+            self._parallel_next_submit_index = 0
+            self._parallel_next_emit_index = 0
+
+    def _generate_tts_result(self, original_text, sentence_id):
+        text = MarkdownCleaner.clean_markdown(original_text)
+        if self._correct_words_pattern:
+            text = self._correct_words_pattern.sub(
+                lambda m: self.correct_words[m.group(0)], text
+            )
+
+        max_repeat_time = self.tts_max_retries
+        attempts = max_repeat_time
+        result = {
+            "ok": False,
+            "text": original_text,
+            "sentence_id": sentence_id,
+            "audio_bytes": None,
+            "tmp_file": None,
+        }
+
+        if self.delete_audio_file:
+            while max_repeat_time > 0:
+                try:
+                    audio_bytes = self._run_text_to_speak(text, None)
+                    if audio_bytes:
+                        result["ok"] = True
+                        result["audio_bytes"] = audio_bytes
+                        break
+                    max_repeat_time -= 1
+                except Exception as e:
+                    logger.bind(tag=TAG).warning(
+                        f"语音生成失败{attempts - max_repeat_time + 1}次: {original_text}，错误: {e}"
+                    )
+                    max_repeat_time -= 1
+
+            if max_repeat_time > 0:
+                logger.bind(tag=TAG).info(
+                    f"语音生成成功: {original_text}，重试{attempts - max_repeat_time}次"
+                )
+            else:
+                logger.bind(tag=TAG).error(
+                    f"语音生成失败: {original_text}，请检查网络或服务是否正常"
+                )
+            return result
+
+        tmp_file = self.generate_filename()
+        result["tmp_file"] = tmp_file
+        try:
+            while not self._has_audio_file(tmp_file) and max_repeat_time > 0:
+                try:
+                    self._remove_audio_file_if_exists(tmp_file)
+                    self._run_text_to_speak(text, tmp_file)
+                    if not self._has_audio_file(tmp_file):
+                        logger.bind(tag=TAG).warning(
+                            f"语音生成空文件: {original_text}:{tmp_file}"
+                        )
+                        max_repeat_time -= 1
+                except Exception as e:
+                    logger.bind(tag=TAG).warning(
+                        f"语音生成失败{attempts - max_repeat_time + 1}次: {original_text}，错误: {e}"
+                    )
+                    self._remove_audio_file_if_exists(tmp_file)
+                    max_repeat_time -= 1
+
+            if max_repeat_time > 0 and self._has_audio_file(tmp_file):
+                result["ok"] = True
+                logger.bind(tag=TAG).info(
+                    f"语音生成成功: {original_text}:{tmp_file}，重试{attempts - max_repeat_time}次"
+                )
+            else:
+                logger.bind(tag=TAG).error(
+                    f"语音生成失败: {original_text}，请检查网络或服务是否正常"
+                )
+            return result
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"Failed to generate TTS file: {e}")
+            return result
+
+    def _emit_tts_result(self, result, opus_handler=None):
+        if not result or not result.get("ok"):
+            return
+
+        sentence_id = result.get("sentence_id")
+        if sentence_id is not None and sentence_id != self.conn.sentence_id:
+            return
+
+        callback = opus_handler or self._make_opus_handler(sentence_id)
+        self.tts_audio_queue.put(
+            (SentenceType.FIRST, None, result["text"], sentence_id)
+        )
+
+        if result.get("audio_bytes"):
+            audio_bytes_to_data_stream(
+                result["audio_bytes"],
+                file_type=self.audio_file_type,
+                is_opus=True,
+                callback=callback,
+                sample_rate=self.conn.sample_rate,
+                opus_encoder=self.opus_encoder,
+            )
+        elif result.get("tmp_file"):
+            self._process_audio_file_stream(result["tmp_file"], callback=callback)
+
+    def _submit_parallel_tts(self, text, sentence_id):
+        with self._parallel_tts_lock:
+            index = self._parallel_next_submit_index
+            self._parallel_next_submit_index += 1
+            future = self._get_parallel_executor().submit(
+                self._generate_tts_result, text, sentence_id
+            )
+            self._parallel_tts_futures[index] = future
+            self._parallel_tts_meta[index] = {
+                "text": text,
+                "sentence_id": sentence_id,
+                "submitted_at": time.monotonic(),
+            }
+        future.add_done_callback(lambda _: self._drain_parallel_tts(block=False))
+        logger.bind(tag=TAG).debug(
+            f"提交MQTT并行TTS任务: index={index}, sentence_id={sentence_id}, text={text}"
+        )
+
+    def _has_parallel_tts_futures(self):
+        with self._parallel_tts_lock:
+            return bool(self._parallel_tts_futures)
+
+    def _drain_parallel_tts(self, block=False, timeout=None):
+        emitted_any = False
+        with self._parallel_tts_emit_lock:
+            while True:
+                with self._parallel_tts_lock:
+                    index = self._parallel_next_emit_index
+                    future = self._parallel_tts_futures.get(index)
+                    meta = self._parallel_tts_meta.get(index, {})
+                if future is None:
+                    break
+                if not block and not future.done():
+                    break
+                if block and timeout is not None and not future.done():
+                    done, _ = concurrent.futures.wait([future], timeout=timeout)
+                    if not done:
+                        elapsed = time.monotonic() - meta.get(
+                            "submitted_at", time.monotonic()
+                        )
+                        logger.bind(tag=TAG).warning(
+                            "MQTT并行TTS任务等待超时，继续等待完整分段: "
+                            f"index={index}, elapsed={elapsed:.1f}s, text={meta.get('text')}"
+                        )
+                        return emitted_any
+
+                try:
+                    result = future.result()
+                except concurrent.futures.CancelledError:
+                    result = None
+                except Exception as e:
+                    logger.bind(tag=TAG).error(f"MQTT并行TTS任务失败: {e}")
+                    result = None
+
+                with self._parallel_tts_lock:
+                    if self._parallel_tts_futures.get(index) is not future:
+                        continue
+                    del self._parallel_tts_futures[index]
+                    self._parallel_tts_meta.pop(index, None)
+                    if self._parallel_next_emit_index == index:
+                        self._parallel_next_emit_index += 1
+
+                if self.conn.client_abort:
+                    continue
+                self._emit_tts_result(result)
+                emitted_any = True
+        return emitted_any
+
+    def _process_tts_segment(self, segment_text, sentence_id, opus_handler=None):
+        if self._should_parallelize_tts():
+            self._submit_parallel_tts(segment_text, sentence_id)
+            with self._parallel_tts_lock:
+                pending_count = len(self._parallel_tts_futures)
+            if pending_count > self.mqtt_tts_parallel_window:
+                logger.bind(tag=TAG).debug(
+                    f"MQTT并行TTS待发送分段超过窗口: pending={pending_count}, window={self.mqtt_tts_parallel_window}"
+                )
+            self._drain_parallel_tts(block=False)
+        else:
+            self.to_tts_stream(segment_text, opus_handler=opus_handler)
+
+    def _load_mqtt_runtime_config(self, config):
+        self.mqtt_tts_parallel_enabled = bool(
+            config.get("mqtt_tts_parallel_enabled", self.mqtt_tts_parallel_enabled)
+        )
+        self.mqtt_tts_parallel_workers = max(
+            1,
+            min(
+                4,
+                int(config.get("mqtt_tts_parallel_workers", self.mqtt_tts_parallel_workers)),
+            ),
+        )
+        self.mqtt_tts_parallel_window = max(
+            self.mqtt_tts_parallel_workers,
+            int(config.get("mqtt_tts_parallel_window", self.mqtt_tts_parallel_window)),
+        )
+        self.mqtt_tts_order_timeout = max(
+            1,
+            int(config.get("mqtt_tts_order_timeout", self.mqtt_tts_order_timeout)),
+        )
+        self.mqtt_tts_min_segment_chars = max(
+            1,
+            int(config.get("mqtt_tts_min_segment_chars", self.mqtt_tts_min_segment_chars)),
+        )
+        split_punctuations = config.get("mqtt_tts_split_punctuations")
+        if split_punctuations:
+            self.mqtt_tts_split_punctuations = tuple(split_punctuations)
+
     def to_tts_stream(self, text, opus_handler: Callable[[bytes], None] = None) -> None:
         # 保留原始文本用于显示/上报
         original_text = text
@@ -127,12 +420,13 @@ class TTSProviderBase(ABC):
         # 使用正则一次性替换，避免重复遍历和部分匹配问题
         if self._correct_words_pattern:
             text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
-        max_repeat_time = 5
+        max_repeat_time = self.tts_max_retries
+        attempts = max_repeat_time
         if self.delete_audio_file:
             # 需要删除文件的直接转为音频数据
             while max_repeat_time > 0:
                 try:
-                    audio_bytes = asyncio.run(self.text_to_speak(text, None))
+                    audio_bytes = self._run_text_to_speak(text, None)
                     if audio_bytes:
                         # 使用原始文本用于显示/上报
                         self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
@@ -149,12 +443,12 @@ class TTSProviderBase(ABC):
                         max_repeat_time -= 1
                 except Exception as e:
                     logger.bind(tag=TAG).warning(
-                        f"语音生成失败{5 - max_repeat_time + 1}次: {original_text}，错误: {e}"
+                        f"语音生成失败{attempts - max_repeat_time + 1}次: {original_text}，错误: {e}"
                     )
                     max_repeat_time -= 1
             if max_repeat_time > 0:
                 logger.bind(tag=TAG).info(
-                    f"语音生成成功: {original_text}，重试{5 - max_repeat_time}次"
+                    f"语音生成成功: {original_text}，重试{attempts - max_repeat_time}次"
                 )
             else:
                 logger.bind(tag=TAG).error(
@@ -164,28 +458,33 @@ class TTSProviderBase(ABC):
         else:
             tmp_file = self.generate_filename()
             try:
-                while not os.path.exists(tmp_file) and max_repeat_time > 0:
+                while not self._has_audio_file(tmp_file) and max_repeat_time > 0:
                     try:
-                        asyncio.run(self.text_to_speak(text, tmp_file))
+                        self._remove_audio_file_if_exists(tmp_file)
+                        self._run_text_to_speak(text, tmp_file)
+                        if not self._has_audio_file(tmp_file):
+                            logger.bind(tag=TAG).warning(
+                                f"语音生成空文件: {original_text}:{tmp_file}"
+                            )
+                            max_repeat_time -= 1
                     except Exception as e:
                         logger.bind(tag=TAG).warning(
-                            f"语音生成失败{5 - max_repeat_time + 1}次: {original_text}，错误: {e}"
+                            f"语音生成失败{attempts - max_repeat_time + 1}次: {original_text}，错误: {e}"
                         )
                         # 未执行成功，删除文件
-                        if os.path.exists(tmp_file):
-                            os.remove(tmp_file)
+                        self._remove_audio_file_if_exists(tmp_file)
                         max_repeat_time -= 1
 
-                if max_repeat_time > 0:
+                if max_repeat_time > 0 and self._has_audio_file(tmp_file):
                     logger.bind(tag=TAG).info(
-                        f"语音生成成功: {original_text}:{tmp_file}，重试{5 - max_repeat_time}次"
+                        f"语音生成成功: {original_text}:{tmp_file}，重试{attempts - max_repeat_time}次"
                     )
+                    self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
+                    self._process_audio_file_stream(tmp_file, callback=opus_handler)
                 else:
                     logger.bind(tag=TAG).error(
                         f"语音生成失败: {original_text}，请检查网络或服务是否正常"
                     )
-                self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
-                self._process_audio_file_stream(tmp_file, callback=opus_handler)
             except Exception as e:
                 logger.bind(tag=TAG).error(f"Failed to generate TTS file: {e}")
                 return None
@@ -196,12 +495,13 @@ class TTSProviderBase(ABC):
         text = MarkdownCleaner.clean_markdown(text)
         if self._correct_words_pattern:
             text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
-        max_repeat_time = 5
+        max_repeat_time = self.tts_max_retries
+        attempts = max_repeat_time
         if self.delete_audio_file:
             # 需要删除文件的直接转为音频数据
             while max_repeat_time > 0:
                 try:
-                    audio_bytes = asyncio.run(self.text_to_speak(text, None))
+                    audio_bytes = self._run_text_to_speak(text, None)
                     if audio_bytes:
                         audio_datas = []
                         audio_bytes_to_data_stream(
@@ -216,12 +516,12 @@ class TTSProviderBase(ABC):
                         max_repeat_time -= 1
                 except Exception as e:
                     logger.bind(tag=TAG).warning(
-                        f"语音生成失败{5 - max_repeat_time + 1}次: {original_text}，错误: {e}"
+                        f"语音生成失败{attempts - max_repeat_time + 1}次: {original_text}，错误: {e}"
                     )
                     max_repeat_time -= 1
             if max_repeat_time > 0:
                 logger.bind(tag=TAG).info(
-                    f"语音生成成功: {original_text}，重试{5 - max_repeat_time}次"
+                    f"语音生成成功: {original_text}，重试{attempts - max_repeat_time}次"
                 )
             else:
                 logger.bind(tag=TAG).error(
@@ -231,28 +531,33 @@ class TTSProviderBase(ABC):
         else:
             tmp_file = self.generate_filename()
             try:
-                while not os.path.exists(tmp_file) and max_repeat_time > 0:
+                while not self._has_audio_file(tmp_file) and max_repeat_time > 0:
                     try:
-                        asyncio.run(self.text_to_speak(text, tmp_file))
+                        self._remove_audio_file_if_exists(tmp_file)
+                        self._run_text_to_speak(text, tmp_file)
+                        if not self._has_audio_file(tmp_file):
+                            logger.bind(tag=TAG).warning(
+                                f"语音生成空文件: {original_text}:{tmp_file}"
+                            )
+                            max_repeat_time -= 1
                     except Exception as e:
                         logger.bind(tag=TAG).warning(
-                            f"语音生成失败{5 - max_repeat_time + 1}次: {original_text}，错误: {e}"
+                            f"语音生成失败{attempts - max_repeat_time + 1}次: {original_text}，错误: {e}"
                         )
                         # 未执行成功，删除文件
-                        if os.path.exists(tmp_file):
-                            os.remove(tmp_file)
+                        self._remove_audio_file_if_exists(tmp_file)
                         max_repeat_time -= 1
 
-                if max_repeat_time > 0:
+                if max_repeat_time > 0 and self._has_audio_file(tmp_file):
                     logger.bind(tag=TAG).info(
-                        f"语音生成成功: {original_text}:{tmp_file}，重试{5 - max_repeat_time}次"
+                        f"语音生成成功: {original_text}:{tmp_file}，重试{attempts - max_repeat_time}次"
                     )
+                    return tmp_file
                 else:
                     logger.bind(tag=TAG).error(
                         f"语音生成失败: {original_text}，请检查网络或服务是否正常"
                     )
-
-                return tmp_file
+                    return None
             except Exception as e:
                 logger.bind(tag=TAG).error(f"Failed to generate TTS file: {e}")
                 return None
@@ -303,6 +608,7 @@ class TTSProviderBase(ABC):
 
     async def open_audio_channels(self, conn):
         self.conn = conn
+        self._load_mqtt_runtime_config(conn.config)
 
         # 根据conn的sample_rate创建编码器，如果子类已经创建则不覆盖（IndexTTS接口返回为24kHZ-待重采样处理）
         if not hasattr(self, 'opus_encoder') or self.opus_encoder is None:
@@ -382,20 +688,46 @@ class TTSProviderBase(ABC):
                     self.tts_text_buff = []
                     self.is_first_sentence = True
                     self.tts_audio_first_sentence = True
+                    self._reset_parallel_tts_state()
                 elif ContentType.TEXT == message.content_type:
                     self.tts_text_buff.append(message.content_detail)
-                    segment_text = self._get_segment_text()
-                    if segment_text:
-                        self.to_tts_stream(segment_text, opus_handler=self.handle_opus)
+                    self._process_available_tts_segments(message.sentence_id)
                 elif ContentType.FILE == message.content_type:
-                    self._process_remaining_text_stream(opus_handler=self.handle_opus)
+                    if self._should_parallelize_tts():
+                        self._process_available_tts_segments(message.sentence_id)
+                        segment_text = self._take_remaining_segment_text()
+                        if segment_text:
+                            self._process_tts_segment(
+                                segment_text,
+                                message.sentence_id,
+                                opus_handler=self._make_opus_handler(message.sentence_id),
+                            )
+                        self._flush_parallel_tts()
+                    else:
+                        self._process_remaining_text_stream(
+                            opus_handler=self._make_opus_handler(message.sentence_id)
+                        )
                     tts_file = message.content_file
                     if tts_file and os.path.exists(tts_file):
                         self._process_audio_file_stream(
-                            tts_file, callback=self.handle_opus
+                            tts_file,
+                            callback=self._make_opus_handler(message.sentence_id),
                         )
                 if message.sentence_type == SentenceType.LAST:
-                    self._process_remaining_text_stream(opus_handler=self.handle_opus)
+                    if self._should_parallelize_tts():
+                        self._process_available_tts_segments(message.sentence_id)
+                        segment_text = self._take_remaining_segment_text()
+                        if segment_text:
+                            self._process_tts_segment(
+                                segment_text,
+                                message.sentence_id,
+                                opus_handler=self._make_opus_handler(message.sentence_id),
+                            )
+                        self._flush_parallel_tts()
+                    else:
+                        self._process_remaining_text_stream(
+                            opus_handler=self._make_opus_handler(message.sentence_id)
+                        )
                     self.tts_audio_queue.put(
                         (message.sentence_type, [], message.content_detail, message.sentence_id)
                     )
@@ -412,7 +744,6 @@ class TTSProviderBase(ABC):
         # 需要上报的文本和音频列表
         enqueue_text = None
         enqueue_audio = []
-        pending_mqtt_audio_items = []
         while not self.conn.stop_event.is_set():
             text = None
             try:
@@ -431,18 +762,9 @@ class TTSProviderBase(ABC):
                 if self.conn.client_abort:
                     logger.bind(tag=TAG).debug("收到打断信号，跳过当前音频数据")
                     enqueue_text, enqueue_audio = None, []
-                    pending_mqtt_audio_items = []
                     continue
 
-                if self.conn.conn_from_mqtt_gateway:
-                    pending_mqtt_audio_items.append((sentence_type, audio_datas, text, sentence_id))
-                    if sentence_type != SentenceType.LAST:
-                        continue
-                    audio_items = pending_mqtt_audio_items
-                    pending_mqtt_audio_items = []
-                else:
-                    audio_items = [(sentence_type, audio_datas, text, sentence_id)]
-
+                audio_items = [(sentence_type, audio_datas, text, sentence_id)]
                 for sentence_type, audio_datas, text, sentence_id in audio_items:
                     # 收到下一个文本开始或会话结束时进行上报
                     if sentence_type is not SentenceType.MIDDLE:
@@ -489,6 +811,9 @@ class TTSProviderBase(ABC):
     async def close(self):
         """资源清理方法"""
         self._sentence_text_map.clear()
+        if self._parallel_executor is not None:
+            self._parallel_executor.shutdown(wait=False, cancel_futures=True)
+            self._parallel_executor = None
         if hasattr(self, "ws") and self.ws:
             await self.ws.close()
 
@@ -499,24 +824,7 @@ class TTSProviderBase(ABC):
         last_punct_pos = -1
 
         if self.conn.conn_from_mqtt_gateway and not self.tts_stop_request:
-            min_segment_chars = int(self.conn.config.get("mqtt_tts_min_segment_chars", 45))
-            if len(current_text) < min_segment_chars:
-                return None
-            for punct in self.punctuations:
-                pos = current_text.rfind(punct)
-                if pos > last_punct_pos:
-                    last_punct_pos = pos
-
-            if last_punct_pos == -1:
-                return None
-
-            segment_text_raw = current_text[: last_punct_pos + 1]
-            segment_text = textUtils.get_string_no_punctuation_or_emoji(
-                segment_text_raw
-            )
-            self.processed_chars += len(segment_text_raw)
-            self.is_first_sentence = False
-            return segment_text
+            return self._get_mqtt_segment_text(full_text, current_text)
 
         # 根据是否是第一句话选择不同的标点符号集合
         punctuations_to_use = (
@@ -551,6 +859,64 @@ class TTSProviderBase(ABC):
         else:
             return None
 
+    def _process_available_tts_segments(self, sentence_id):
+        while True:
+            segment_text = self._get_segment_text()
+            if not segment_text:
+                break
+            self._process_tts_segment(
+                segment_text,
+                sentence_id,
+                opus_handler=self._make_opus_handler(sentence_id),
+            )
+
+    def _flush_parallel_tts(self):
+        while self._has_parallel_tts_futures():
+            stop_event = getattr(self.conn, "stop_event", None)
+            if (
+                (stop_event is not None and stop_event.is_set())
+                or self.conn.client_abort
+            ):
+                self._reset_parallel_tts_state()
+                break
+            self._drain_parallel_tts(
+                block=True,
+                timeout=self.mqtt_tts_order_timeout,
+            )
+
+    def _get_mqtt_segment_text(self, full_text, current_text):
+        min_segment_chars = self.mqtt_tts_min_segment_chars
+        closing_punctuations = "”’\"')）】》"
+
+        if len(current_text) < min_segment_chars:
+            return None
+
+        segment_end = -1
+        for index, char in enumerate(current_text):
+            if index + 1 < min_segment_chars:
+                continue
+            if char in self.mqtt_tts_split_punctuations:
+                segment_end = index + 1
+                while (
+                    segment_end < len(current_text)
+                    and current_text[segment_end] in closing_punctuations
+                ):
+                    segment_end += 1
+                break
+
+        if segment_end == -1:
+            return None
+
+        segment_text_raw = current_text[:segment_end]
+        self.processed_chars += len(segment_text_raw)
+        self.is_first_sentence = False
+        return self._normalize_mqtt_tts_text(segment_text_raw)
+
+    def _normalize_mqtt_tts_text(self, text):
+        text = textUtils.get_string_no_punctuation_or_emoji(text)
+        text = re.sub(r"\s+", " ", text).strip(" ~～")
+        return text or None
+
     def _process_audio_file_stream(
         self, tts_file, callback: Callable[[Any], Any]
     ) -> None:
@@ -581,6 +947,24 @@ class TTSProviderBase(ABC):
         self.before_stop_play_files.clear()
         self.tts_audio_queue.put((SentenceType.LAST, [], None, getattr(self, 'current_sentence_id', None)))
 
+    def _take_remaining_segment_text(self):
+        """取出剩余未处理文本
+
+        Returns:
+            str|None: 可生成语音的剩余文本
+        """
+        full_text = "".join(self.tts_text_buff)
+        remaining_text = full_text[self.processed_chars :]
+        if remaining_text:
+            if self.conn.conn_from_mqtt_gateway:
+                segment_text = self._normalize_mqtt_tts_text(remaining_text)
+            else:
+                segment_text = textUtils.get_string_no_punctuation_or_emoji(remaining_text)
+            if segment_text:
+                self.processed_chars = len(full_text)
+                return segment_text
+        return None
+
     def _process_remaining_text_stream(
         self, opus_handler: Callable[[bytes], None] = None
     ):
@@ -589,14 +973,10 @@ class TTSProviderBase(ABC):
         Returns:
             bool: 是否成功处理了文本
         """
-        full_text = "".join(self.tts_text_buff)
-        remaining_text = full_text[self.processed_chars :]
-        if remaining_text:
-            segment_text = textUtils.get_string_no_punctuation_or_emoji(remaining_text)
-            if segment_text:
-                self.to_tts_stream(segment_text, opus_handler=opus_handler)
-                self.processed_chars += len(full_text)
-                return True
+        segment_text = self._take_remaining_segment_text()
+        if segment_text:
+            self.to_tts_stream(segment_text, opus_handler=opus_handler)
+            return True
         return False
 
     def _apply_percentage_params(self, config):

@@ -100,14 +100,27 @@ def initialize_modules(
 
 def initialize_tts(config):
     select_tts_module = config["selected_module"]["TTS"]
+    tts_config = dict(config["TTS"][select_tts_module])
+    for key in (
+        "tts_timeout",
+        "tts_max_retries",
+        "mqtt_tts_parallel_enabled",
+        "mqtt_tts_parallel_workers",
+        "mqtt_tts_parallel_window",
+        "mqtt_tts_order_timeout",
+        "mqtt_tts_min_segment_chars",
+        "mqtt_tts_split_punctuations",
+    ):
+        if key in config and key not in tts_config:
+            tts_config[key] = config[key]
     tts_type = (
         select_tts_module
-        if "type" not in config["TTS"][select_tts_module]
-        else config["TTS"][select_tts_module]["type"]
+        if "type" not in tts_config
+        else tts_config["type"]
     )
     new_tts = tts.create_instance(
         tts_type,
-        config["TTS"][select_tts_module],
+        tts_config,
         str(config.get("delete_audio", True)).lower() in ("true", "1", "yes"),
     )
     return new_tts

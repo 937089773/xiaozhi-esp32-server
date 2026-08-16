@@ -16,6 +16,12 @@ TAG = __name__
 AUDIO_FRAME_DURATION = 60
 # 预缓冲包数量，直接发送以减少延迟
 PRE_BUFFER_COUNT = 5
+MQTT_AUDIO_PACKET_TYPE_SINGLE = 1
+MQTT_AUDIO_PACKET_TYPE_BUNDLE = 2
+MQTT_AUDIO_BUNDLE_DEFAULT_FRAMES = 4
+MQTT_AUDIO_BUNDLE_MAX_FRAMES = 8
+MQTT_AUDIO_BUNDLE_DEFAULT_MAX_BYTES = 4096
+MQTT_AUDIO_BUNDLE_DEFAULT_FLUSH_MS = 60
 
 
 async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text, sentence_id=None):
@@ -30,7 +36,8 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
     if sentenceType == SentenceType.FIRST:
         # 同一句子的后续消息加入流控队列，其他情况立即发送
         if (
-            hasattr(conn, "audio_rate_controller")
+            not getattr(conn, "conn_from_mqtt_gateway", False)
+            and hasattr(conn, "audio_rate_controller")
             and conn.audio_rate_controller
             and getattr(conn, "audio_flow_control", {}).get("sentence_id")
             == conn.sentence_id
@@ -43,6 +50,8 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
             await send_tts_message(conn, "sentence_start", text)
 
     await sendAudio(conn, audios)
+    if getattr(conn, "conn_from_mqtt_gateway", False) and sentenceType == SentenceType.LAST:
+        await _flush_mqtt_pending_audio(conn, reason="sentence_end")
     # 发送句子开始消息
     if sentenceType is not SentenceType.MIDDLE:
         conn.logger.bind(tag=TAG).info(f"发送音频消息: {sentenceType}, {text}")
@@ -62,6 +71,21 @@ async def _wait_for_audio_completion(conn: "ConnectionHandler"):
     Args:
         conn: 连接对象
     """
+    if getattr(conn, "conn_from_mqtt_gateway", False):
+        await _flush_mqtt_pending_audio(conn, reason="wait_completion")
+        flow_control = getattr(conn, "mqtt_audio_flow_control", None)
+        if not flow_control:
+            return
+        playback_started_at = flow_control.get("playback_started_at")
+        playback_ms = flow_control.get("playback_ms", 0)
+        if playback_started_at is None or playback_ms <= 0:
+            return
+        remaining = playback_ms / 1000.0 - (time.monotonic() - playback_started_at)
+        if remaining > 0:
+            await asyncio.sleep(remaining + 0.24)
+        _log_conn_debug(conn, "MQTT音频播放预计完成")
+        return
+
     if hasattr(conn, "audio_rate_controller") and conn.audio_rate_controller:
         rate_controller = conn.audio_rate_controller
         conn.logger.bind(tag=TAG).debug(
@@ -89,28 +113,31 @@ async def _send_to_mqtt_gateway(
         timestamp: 时间戳
         sequence: 序列号
     """
-    # 如果启用了服务端AEC，缓存PCM数据用于后续AEC处理
-    if conn.client_aec and timestamp > 0:
-        if not hasattr(conn, "aec_audio_cache"):
-            conn.aec_audio_cache = {}
-            conn.aec_audio_cache_time = {}
-            conn._send_opus_decoder = opuslib_next.Decoder(16000, 1)
-        # 解码opus为PCM后缓存
-        pcm_data = conn._send_opus_decoder.decode(bytes(opus_packet), 960)
-        conn.aec_audio_cache[timestamp] = bytes(pcm_data)
-        conn.aec_audio_cache_time[timestamp] = time.time()
+    _cache_mqtt_aec_audio(conn, opus_packet, timestamp)
 
     # 为opus数据包添加16字节头部
     header = bytearray(16)
-    header[0] = 1  # type
+    header[0] = MQTT_AUDIO_PACKET_TYPE_SINGLE  # type
     header[2:4] = len(opus_packet).to_bytes(2, "big")  # payload length
     header[4:8] = sequence.to_bytes(4, "big")  # sequence
     header[8:12] = timestamp.to_bytes(4, "big")  # 时间戳
     header[12:16] = len(opus_packet).to_bytes(4, "big")  # opus长度
 
     # 发送包含头部的完整数据包
-    complete_packet = bytes(header) + opus_packet
+    complete_packet = bytes(header) + bytes(opus_packet)
     await conn.websocket.send(complete_packet)
+
+
+def _cache_mqtt_aec_audio(conn: "ConnectionHandler", opus_packet, timestamp):
+    if not getattr(conn, "client_aec", False) or timestamp <= 0:
+        return
+    if not hasattr(conn, "aec_audio_cache"):
+        conn.aec_audio_cache = {}
+        conn.aec_audio_cache_time = {}
+        conn._send_opus_decoder = opuslib_next.Decoder(16000, 1)
+    pcm_data = conn._send_opus_decoder.decode(bytes(opus_packet), 960)
+    conn.aec_audio_cache[timestamp] = bytes(pcm_data)
+    conn.aec_audio_cache_time[timestamp] = time.time()
 
 
 async def sendAudio(
@@ -128,23 +155,253 @@ async def sendAudio(
         return
 
     send_delay_ms = conn.config.get("tts_audio_send_delay", -1)
-    if conn.conn_from_mqtt_gateway and send_delay_ms <= 0:
-        send_delay_ms = 20
     send_delay = send_delay_ms / 1000.0
     is_single_packet = isinstance(audios, bytes)
+    audio_list = [audios] if is_single_packet else list(audios)
+
+    if getattr(conn, "conn_from_mqtt_gateway", False):
+        flow_control = _get_or_create_mqtt_flow_control(conn)
+        await _send_mqtt_audio_bundles(conn, audio_list, flow_control, frame_duration)
+        return
 
     # 初始化或获取 RateController
     rate_controller, flow_control = _get_or_create_rate_controller(
         conn, frame_duration, is_single_packet
     )
 
-    # 统一转换为列表处理
-    audio_list = [audios] if is_single_packet else audios
-
     # 发送音频包
     await _send_audio_with_rate_control(
         conn, audio_list, rate_controller, flow_control, send_delay
     )
+
+
+def _get_or_create_mqtt_flow_control(conn: "ConnectionHandler"):
+    if hasattr(conn, "audio_rate_controller") and conn.audio_rate_controller:
+        conn.audio_rate_controller.stop_sending()
+        conn.audio_rate_controller = None
+
+    flow_control = getattr(conn, "mqtt_audio_flow_control", None)
+    if (
+        not flow_control
+        or flow_control.get("sentence_id") != conn.sentence_id
+    ):
+        conn.mqtt_audio_flow_control = {
+            "packet_count": 0,
+            "sequence": 0,
+            "sentence_id": conn.sentence_id,
+            "playback_started_at": None,
+            "playback_ms": 0,
+            "published_messages": 0,
+            "pending_frames": [],
+            "pending_bytes": 0,
+            "bundle_flush_task": None,
+            "frame_duration": AUDIO_FRAME_DURATION,
+        }
+    return conn.mqtt_audio_flow_control
+
+
+def _get_config_int(conn: "ConnectionHandler", key, default, minimum, maximum):
+    try:
+        value = int(conn.config.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _log_conn_debug(conn: "ConnectionHandler", message, *args):
+    logger = getattr(conn, "logger", None)
+    if logger is not None:
+        logger.bind(tag=TAG).debug(message, *args)
+
+
+async def _flush_mqtt_pending_audio(
+    conn: "ConnectionHandler",
+    flow_control=None,
+    frame_duration=None,
+    reason=None,
+):
+    if flow_control is None:
+        flow_control = getattr(conn, "mqtt_audio_flow_control", None)
+    if not flow_control:
+        return
+
+    current_task = asyncio.current_task()
+    flush_task = flow_control.get("bundle_flush_task")
+    if flush_task and flush_task is not current_task:
+        if not flush_task.done():
+            flush_task.cancel()
+        flow_control["bundle_flush_task"] = None
+    elif flush_task is current_task or flush_task is None:
+        flow_control["bundle_flush_task"] = None
+
+    frames = flow_control.get("pending_frames") or []
+    if not frames:
+        flow_control["pending_bytes"] = 0
+        return
+
+    if conn.client_abort:
+        flow_control["pending_frames"] = []
+        flow_control["pending_bytes"] = 0
+        return
+
+    frame_duration = frame_duration or flow_control.get(
+        "frame_duration", AUDIO_FRAME_DURATION
+    )
+    flow_control["pending_frames"] = []
+    flow_control["pending_bytes"] = 0
+    await _do_send_mqtt_audio_chunk(conn, frames, flow_control, frame_duration)
+    _log_conn_debug(
+        conn,
+        "MQTT音频打包发送: frames={}, reason={}, pending=0",
+        len(frames),
+        reason or "manual",
+    )
+
+
+def _schedule_mqtt_pending_audio_flush(conn, flow_control, frame_duration):
+    flush_task = flow_control.get("bundle_flush_task")
+    if flush_task and not flush_task.done():
+        return
+
+    flush_ms = _get_config_int(
+        conn,
+        "mqtt_audio_bundle_flush_ms",
+        MQTT_AUDIO_BUNDLE_DEFAULT_FLUSH_MS,
+        10,
+        500,
+    )
+
+    async def flush_later():
+        try:
+            await asyncio.sleep(flush_ms / 1000.0)
+            await _flush_mqtt_pending_audio(
+                conn,
+                flow_control,
+                frame_duration,
+                reason="timer",
+            )
+        except asyncio.CancelledError:
+            pass
+
+    flow_control["bundle_flush_task"] = asyncio.create_task(flush_later())
+
+
+async def _send_mqtt_audio_bundles(
+    conn: "ConnectionHandler", audio_list, flow_control, frame_duration
+):
+    bundle_frames = _get_config_int(
+        conn,
+        "mqtt_audio_bundle_frames",
+        MQTT_AUDIO_BUNDLE_DEFAULT_FRAMES,
+        1,
+        MQTT_AUDIO_BUNDLE_MAX_FRAMES,
+    )
+    max_bundle_bytes = _get_config_int(
+        conn,
+        "mqtt_audio_bundle_max_bytes",
+        MQTT_AUDIO_BUNDLE_DEFAULT_MAX_BYTES,
+        256,
+        60000,
+    )
+    flow_control["frame_duration"] = frame_duration
+    message_count_before = flow_control.get("published_messages", 0)
+    frame_count_before = flow_control.get("packet_count", 0)
+
+    for packet in audio_list:
+        if conn.client_abort:
+            await _flush_mqtt_pending_audio(
+                conn, flow_control, frame_duration, reason="abort"
+            )
+            return
+
+        packet_size = len(packet)
+        if packet_size > 0xFFFF:
+            await _flush_mqtt_pending_audio(
+                conn, flow_control, frame_duration, reason="oversized"
+            )
+            _log_conn_debug(conn, "跳过过大的MQTT音频帧: bytes={}", packet_size)
+            continue
+
+        pending_frames = flow_control.setdefault("pending_frames", [])
+        pending_bytes = flow_control.get("pending_bytes", 0)
+        next_size = pending_bytes + 2 + packet_size
+        if pending_frames and (
+            len(pending_frames) >= bundle_frames or next_size > max_bundle_bytes
+        ):
+            await _flush_mqtt_pending_audio(
+                conn, flow_control, frame_duration, reason="bundle_full"
+            )
+            pending_frames = flow_control.setdefault("pending_frames", [])
+            pending_bytes = flow_control.get("pending_bytes", 0)
+
+        pending_frames.append(packet)
+        flow_control["pending_bytes"] = pending_bytes + 2 + packet_size
+
+        if len(pending_frames) >= bundle_frames:
+            await _flush_mqtt_pending_audio(
+                conn, flow_control, frame_duration, reason="bundle_full"
+            )
+        else:
+            _schedule_mqtt_pending_audio_flush(conn, flow_control, frame_duration)
+
+    if len(audio_list) > 1:
+        await _flush_mqtt_pending_audio(
+            conn, flow_control, frame_duration, reason="batch_end"
+        )
+
+    sent_frames = flow_control.get("packet_count", 0) - frame_count_before
+    sent_messages = flow_control.get("published_messages", 0) - message_count_before
+    if sent_frames:
+        _log_conn_debug(
+            conn,
+            "MQTT音频快速发送: frames={}, mqtt_messages={}, bundle_frames={}, max_bytes={}",
+            sent_frames,
+            sent_messages,
+            bundle_frames,
+            max_bundle_bytes,
+        )
+
+
+async def _do_send_mqtt_audio_chunk(
+    conn: "ConnectionHandler", frames, flow_control, frame_duration
+):
+    if len(frames) == 1:
+        await _do_send_audio(conn, frames[0], flow_control)
+        if flow_control.get("playback_started_at") is None:
+            flow_control["playback_started_at"] = time.monotonic()
+        flow_control["playback_ms"] = flow_control.get("playback_ms", 0) + frame_duration
+        flow_control["published_messages"] = flow_control.get("published_messages", 0) + 1
+        return
+
+    sequence = flow_control.get("sequence", 0)
+    timestamp = int(time.time() * 1000) % (2**32)
+    body = bytearray()
+    for index, frame in enumerate(frames):
+        frame_bytes = bytes(frame)
+        body.extend(len(frame_bytes).to_bytes(2, "big"))
+        body.extend(frame_bytes)
+        _cache_mqtt_aec_audio(
+            conn,
+            frame_bytes,
+            (timestamp + index * frame_duration) % (2**32),
+        )
+
+    header = bytearray(16)
+    header[0] = MQTT_AUDIO_PACKET_TYPE_BUNDLE
+    header[2:4] = len(body).to_bytes(2, "big")
+    header[4:8] = sequence.to_bytes(4, "big")
+    header[8:12] = timestamp.to_bytes(4, "big")
+    header[12:16] = len(frames).to_bytes(4, "big")
+
+    await conn.websocket.send(bytes(header) + bytes(body))
+    conn.last_activity_time = time.time() * 1000
+
+    if flow_control.get("playback_started_at") is None:
+        flow_control["playback_started_at"] = time.monotonic()
+    flow_control["packet_count"] = flow_control.get("packet_count", 0) + len(frames)
+    flow_control["sequence"] = sequence + len(frames)
+    flow_control["playback_ms"] = flow_control.get("playback_ms", 0) + len(frames) * frame_duration
+    flow_control["published_messages"] = flow_control.get("published_messages", 0) + 1
 
 
 def _get_or_create_rate_controller(

@@ -52,7 +52,10 @@ mqtt_transport:
   tls: true
   qos:
     json: 1
-    audio: 1
+    audio: 0
+mqtt_audio_bundle_frames: 4
+mqtt_audio_bundle_max_bytes: 4096
+mqtt_audio_bundle_flush_ms: 60
 log:
   # 设置控制台输出的日志格式，时间、日志级别、标签、消息
   log_format: "<green>{time:YYMMDD HH:mm:ss}</green>[{version}_{selected_module}][<light-blue>{extra[tag]}</light-blue>]-<level>{level}</level>-<light-green>{message}</light-green>"
@@ -72,7 +75,9 @@ delete_audio: false
 # 没有语音输入多久后断开连接(秒)，默认2分钟，即120秒
 close_connection_no_voice_time: 120
 # TTS请求超时时间(秒)
-tts_timeout: 10
+tts_timeout: 15
+# 单段TTS失败重试次数，MQTT播放优先保证后续分段不中断
+tts_max_retries: 2
 # 工具调用超时时间(秒)
 tool_call_timeout: 30
 # 开启唤醒词加速
@@ -89,9 +94,18 @@ enable_websocket_ping: false
 
 # TTS音频发送延迟配置
 # tts_audio_send_delay: 控制音频包发送间隔
-#   0: 使用精确时间控制，严格匹配音频帧率（默认，运行时按音频帧率计算）
+#   0: 使用后台流控队列发送（默认），先预缓冲再按音频帧率发送
 #   > 0: 使用固定延迟（毫秒）发送，例如: 60
 tts_audio_send_delay: 0
+# MQTT模式下并行预生成TTS，生成完成后仍按文本顺序下发
+mqtt_tts_parallel_enabled: true
+mqtt_tts_parallel_workers: 4
+mqtt_tts_parallel_window: 12
+# MQTT模式下按顺序发送时，慢分段超过该时间会记录告警，但不会跳过
+mqtt_tts_order_timeout: 30
+# MQTT模式下按标点分段，避免过短分段导致TTS请求过多
+mqtt_tts_min_segment_chars: 12
+mqtt_tts_split_punctuations: "。？！!?；;：，,、~～\n"
 
 exit_commands:
   - "退出"

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from typing import Callable
 
 from core.transports.mqtt_connection import MqttTransportConnection
@@ -14,12 +15,13 @@ class MqttTransport:
         self.server = server
         self.topic_prefix = config.get("topic_prefix", "xiaozhi/device").rstrip("/")
         self.json_qos = int(config.get("qos", {}).get("json", 1))
-        self.audio_qos = int(config.get("qos", {}).get("audio", 1))
+        self.audio_qos = int(config.get("qos", {}).get("audio", 0))
         self.connection_factory = connection_factory
         self.connections = {}
         self.client = None
         self.logger = None
         self.loop = None
+        self._watchdog_task = None
 
     def extract_device_id(self, topic: str) -> str | None:
         prefix = f"{self.topic_prefix}/"
@@ -63,9 +65,15 @@ class MqttTransport:
         self.client.on_message = self._on_message
         self.client.connect(self.transport_config["endpoint"], int(self.transport_config.get("port", 8883)), keepalive=60)
         self.client.loop_start()
+        self._watchdog_task = asyncio.create_task(self._watch_mqtt_connection())
         self._logger().bind(tag=TAG).info("MQTT transport started")
 
     async def stop(self):
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._watchdog_task
+            self._watchdog_task = None
         if self.client is not None:
             self.client.loop_stop()
             self.client.disconnect()
@@ -108,21 +116,61 @@ class MqttTransport:
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
         self._logger().bind(tag=TAG).info("MQTT transport connected: {}", reason_code)
-        client.subscribe(f"{self.topic_prefix}/+/up/json", qos=self.json_qos)
-        client.subscribe(f"{self.topic_prefix}/+/up/audio", qos=self.audio_qos)
-        client.subscribe(f"{self.topic_prefix}/+/status", qos=self.json_qos)
+        self._subscribe_topics(client)
 
     def _on_disconnect(self, client, userdata, *args):
         reason_code = args[-2] if len(args) >= 2 else (args[0] if args else None)
         self._logger().bind(tag=TAG).warning("MQTT transport disconnected: {}", reason_code)
 
     def _on_message(self, client, userdata, message):
+        if message.topic.endswith("/up/json"):
+            self._logger().bind(tag=TAG).info(
+                "MQTT transport received json topic={}, bytes={}",
+                message.topic,
+                len(message.payload),
+            )
+        elif message.topic.endswith("/up/audio"):
+            self._logger().bind(tag=TAG).debug(
+                "MQTT transport received audio topic={}, bytes={}",
+                message.topic,
+                len(message.payload),
+            )
         if self.loop is not None:
             self.loop.call_soon_threadsafe(
                 lambda: self.loop.create_task(self.handle_message(message.topic, message.payload))
             )
         else:
             asyncio.run(self.handle_message(message.topic, message.payload))
+
+    def _subscribe_topics(self, client):
+        topics = (
+            (f"{self.topic_prefix}/+/up/json", self.json_qos),
+            (f"{self.topic_prefix}/+/up/audio", self.audio_qos),
+            (f"{self.topic_prefix}/+/status", self.json_qos),
+        )
+        for topic, qos in topics:
+            result = client.subscribe(topic, qos=qos)
+            self._logger().bind(tag=TAG).info(
+                "MQTT transport subscribe requested: topic={}, qos={}, result={}",
+                topic,
+                qos,
+                result,
+            )
+
+    async def _watch_mqtt_connection(self):
+        interval = int(self.transport_config.get("watchdog_interval", 30))
+        while True:
+            await asyncio.sleep(interval)
+            client = self.client
+            if client is None:
+                return
+            is_connected = getattr(client, "is_connected", lambda: True)()
+            if not is_connected:
+                self._logger().bind(tag=TAG).warning("MQTT transport watchdog reconnecting")
+                with contextlib.suppress(Exception):
+                    client.reconnect()
+                continue
+            self._subscribe_topics(client)
 
     def _logger(self):
         if self.logger is None:
