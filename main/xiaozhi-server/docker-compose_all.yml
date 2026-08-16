@@ -23,7 +23,9 @@ services:
     security_opt:
       - seccomp:unconfined
     environment:
-      - TZ=Asia/Shanghai
+      TZ: Asia/Shanghai
+      XIAOZHI_TTS_MODE: ${XIAOZHI_TTS_MODE:-online}
+      XIAOZHI_TTS_PROVIDER: ${XIAOZHI_TTS_PROVIDER:-EdgeTTS}
     volumes:
       # 配置文件目录
       - ./data:/opt/xiaozhi-esp32-server/data

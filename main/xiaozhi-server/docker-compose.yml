@@ -12,8 +12,10 @@ services:
     security_opt:
       - seccomp:unconfined
     environment:
-      - TZ=UTC
-      - XIAOZHI_LLM_API_KEY=${XIAOZHI_LLM_API_KEY:-}
+      TZ: UTC
+      XIAOZHI_LLM_API_KEY: ${XIAOZHI_LLM_API_KEY:-}
+      XIAOZHI_TTS_MODE: ${XIAOZHI_TTS_MODE:-online}
+      XIAOZHI_TTS_PROVIDER: ${XIAOZHI_TTS_PROVIDER:-EdgeTTS}
     ports:
       # ws服务端
       - "8000:8000"

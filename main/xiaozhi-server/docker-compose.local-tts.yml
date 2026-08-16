@@ -1,0 +1,62 @@
+# Docker安装Server + 本地TTS(Kokoro)
+
+version: '3'
+services:
+  xiaozhi-esp32-server:
+    image: xiaozhi-esp32-server:only-mqtt-local
+    build:
+      context: ../..
+      dockerfile: Dockerfile-server
+    container_name: xiaozhi-esp32-server
+    restart: always
+    security_opt:
+      - seccomp:unconfined
+    depends_on:
+      - kokoro-tts
+    environment:
+      TZ: UTC
+      XIAOZHI_LLM_API_KEY: ${XIAOZHI_LLM_API_KEY:-}
+      XIAOZHI_TTS_MODE: local
+      XIAOZHI_TTS_PROVIDER: ${XIAOZHI_TTS_PROVIDER:-CustomTTS}
+      XIAOZHI_TTS_URL: ${XIAOZHI_TTS_URL:-http://kokoro-tts:8880/v1/audio/speech}
+      XIAOZHI_TTS_MODEL: ${XIAOZHI_TTS_MODEL:-kokoro}
+      XIAOZHI_TTS_VOICE: ${XIAOZHI_TTS_VOICE:-zf_xiaoxiao}
+      XIAOZHI_TTS_FORMAT: ${XIAOZHI_TTS_FORMAT:-mp3}
+      XIAOZHI_TTS_SPEED: ${XIAOZHI_TTS_SPEED:-1}
+      XIAOZHI_TTS_STREAM: ${XIAOZHI_TTS_STREAM:-false}
+    ports:
+      # ws服务端
+      - "8000:8000"
+      # http服务的端口，用于简单OTA接口(单服务部署)，以及视觉分析接口
+      - "8003:8003"
+    volumes:
+      # 配置文件目录
+      - ./data:/opt/xiaozhi-esp32-server/data
+
+  kokoro-tts:
+    image: xiaozhi-kokoro-modelscope:local
+    build:
+      context: .
+      dockerfile: docker/kokoro-modelscope/Dockerfile
+      args:
+        KOKORO_BASE_IMAGE: ${XIAOZHI_LOCAL_TTS_IMAGE:-docker.1panel.live/hwdsl2/kokoro-server:latest}
+    container_name: kokoro-tts
+    restart: always
+    environment:
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      HF_HOME: /var/lib/kokoro/huggingface
+      HF_HUB_CACHE: /var/lib/kokoro/huggingface/hub
+      HF_HUB_DISABLE_XET: "1"
+      KOKORO_API_KEY: ""
+      KOKORO_LOCAL_MODEL: /var/lib/kokoro/modelscope/Kokoro-82M
+      KOKORO_MODELSCOPE_MODEL: ${KOKORO_MODELSCOPE_MODEL:-hexgrad/Kokoro-82M}
+      KOKORO_VOICE: ${XIAOZHI_TTS_VOICE:-zf_xiaoxiao}
+      KOKORO_LANG_CODE: z
+      KOKORO_SPEED: ${XIAOZHI_TTS_SPEED:-1}
+    ports:
+      - "${XIAOZHI_LOCAL_TTS_PORT:-8880}:8880"
+    volumes:
+      - kokoro-data:/var/lib/kokoro
+
+volumes:
+  kokoro-data:

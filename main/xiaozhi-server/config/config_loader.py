@@ -44,6 +44,7 @@ async def load_config():
     else:
         # 合并配置
         config = merge_configs(default_config, custom_config)
+    apply_tts_mode_from_env(config)
     # 初始化目录
     ensure_directories(config)
 
@@ -82,6 +83,111 @@ async def get_config_from_api_async(config):
     if not config_data.get("prompt_template"):
         config_data["prompt_template"] = config.get("prompt_template")
     return config_data
+
+
+def apply_tts_mode_from_env(config, environ=None):
+    """通过 Docker Compose 注入的环境变量切换在线/本地 TTS。"""
+    if environ is None:
+        environ = os.environ
+    tts_mode = _env_value(environ, "XIAOZHI_TTS_MODE")
+    if not tts_mode:
+        return config
+
+    normalized_mode = tts_mode.lower()
+    if normalized_mode in ("api", "cloud"):
+        normalized_mode = "online"
+    elif normalized_mode in ("offline", "docker"):
+        normalized_mode = "local"
+
+    if normalized_mode not in ("online", "local"):
+        raise ValueError(
+            "XIAOZHI_TTS_MODE must be 'online' or 'local', "
+            f"got: {tts_mode}"
+        )
+
+    selected_module = config.setdefault("selected_module", {})
+    tts_configs = config.setdefault("TTS", {})
+    provider = _env_value(environ, "XIAOZHI_TTS_PROVIDER")
+    if not provider:
+        provider = (
+            "CustomTTS"
+            if normalized_mode == "local"
+            else selected_module.get("TTS", "EdgeTTS")
+        )
+
+    selected_module["TTS"] = provider
+    config["tts_mode"] = normalized_mode
+
+    if normalized_mode == "local" and provider == "CustomTTS":
+        _apply_local_custom_tts_config(tts_configs, environ)
+    elif provider not in tts_configs:
+        raise ValueError(f"TTS provider '{provider}' is not configured")
+
+    return config
+
+
+def _apply_local_custom_tts_config(tts_configs, environ):
+    custom_tts = dict(tts_configs.get("CustomTTS", {}))
+    response_format = _env_value(environ, "XIAOZHI_TTS_FORMAT", "mp3")
+    speed = _env_value(environ, "XIAOZHI_TTS_SPEED", "1")
+
+    params = dict(custom_tts.get("params") or {})
+    params.update(
+        {
+            "model": _env_value(environ, "XIAOZHI_TTS_MODEL", "kokoro"),
+            "input": "{prompt_text}",
+            "voice": _env_value(environ, "XIAOZHI_TTS_VOICE", "zf_xiaoxiao"),
+            "response_format": response_format,
+            "speed": _coerce_scalar(speed),
+            "stream": _env_bool(environ, "XIAOZHI_TTS_STREAM", False),
+        }
+    )
+    lang_code = _env_value(environ, "XIAOZHI_TTS_LANG_CODE")
+    if lang_code:
+        params["lang_code"] = lang_code
+
+    custom_tts.update(
+        {
+            "type": "custom",
+            "method": _env_value(environ, "XIAOZHI_TTS_METHOD", "POST"),
+            "url": _env_value(
+                environ,
+                "XIAOZHI_TTS_URL",
+                "http://kokoro-tts:8880/v1/audio/speech",
+            ),
+            "params": params,
+            "headers": custom_tts.get("headers") or {},
+            "format": response_format,
+            "output_dir": custom_tts.get("output_dir", "tmp/"),
+        }
+    )
+    tts_configs["CustomTTS"] = custom_tts
+
+
+def _env_value(environ, key, default=None):
+    value = environ.get(key)
+    if value is None:
+        return default
+    value = str(value).strip()
+    return value if value else default
+
+
+def _env_bool(environ, key, default=False):
+    value = _env_value(environ, key)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _coerce_scalar(value):
+    if not isinstance(value, str):
+        return value
+    try:
+        if "." in value:
+            return float(value)
+        return int(value)
+    except ValueError:
+        return value
 
 
 async def get_private_config_from_api(config, device_id, client_id):
