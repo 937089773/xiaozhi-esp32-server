@@ -1,9 +1,11 @@
+import os
 import time
 import json
 import uuid
 import random
 import asyncio
 from typing import TYPE_CHECKING
+from pydub import AudioSegment
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
@@ -60,7 +62,7 @@ async def handleHelloMessage(conn: "ConnectionHandler", msg_json):
             conn.logger.bind(tag=TAG).debug("客户端启用了服务端AEC")
             conn.client_aec = True
 
-    await conn.websocket.send(json.dumps(conn.welcome_msg))
+    await conn.websocket.send(json.dumps(conn.welcome_msg, ensure_ascii=False))
 
 
 async def checkWakeupWords(conn: "ConnectionHandler", text):
@@ -128,9 +130,11 @@ async def wakeupWordsResponse(conn: "ConnectionHandler"):
     if not conn.tts:
         return
 
+    lock_acquired = False
     try:
         # 尝试获取锁，如果获取不到就返回
-        if not await _wakeup_response_lock.acquire():
+        lock_acquired = await _wakeup_response_lock.acquire()
+        if not lock_acquired:
             return
 
         # 从预定义回复列表中随机选择一个回复
@@ -146,14 +150,20 @@ async def wakeupWordsResponse(conn: "ConnectionHandler"):
         # 获取当前音色
         voice = getattr(conn.tts, "voice", "default")
 
-        # 使用链接的sample_rate
-        wav_bytes = opus_datas_to_wav_bytes(tts_result, sample_rate=conn.sample_rate)
         file_path = wakeup_words_config.generate_file_path(voice)
-        with open(file_path, "wb") as f:
-            f.write(wav_bytes)
+        if isinstance(tts_result, (str, os.PathLike)):
+            audio = AudioSegment.from_file(tts_result, parameters=["-nostdin"])
+            audio = audio.set_channels(1).set_frame_rate(conn.sample_rate).set_sample_width(2)
+            audio.export(file_path, format="wav")
+        else:
+            wav_bytes = opus_datas_to_wav_bytes(tts_result, sample_rate=conn.sample_rate)
+            with open(file_path, "wb") as f:
+                f.write(wav_bytes)
         # 更新配置
         wakeup_words_config.update_wakeup_response(voice, file_path, result)
+    except Exception as e:
+        conn.logger.bind(tag=TAG).error(f"更新唤醒词回复失败: {e}", exc_info=True)
     finally:
         # 确保在任何情况下都释放锁
-        if _wakeup_response_lock.locked():
+        if lock_acquired and _wakeup_response_lock.locked():
             _wakeup_response_lock.release()

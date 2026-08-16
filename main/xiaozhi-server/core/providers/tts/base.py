@@ -412,6 +412,7 @@ class TTSProviderBase(ABC):
         # 需要上报的文本和音频列表
         enqueue_text = None
         enqueue_audio = []
+        pending_mqtt_audio_items = []
         while not self.conn.stop_event.is_set():
             text = None
             try:
@@ -430,40 +431,51 @@ class TTSProviderBase(ABC):
                 if self.conn.client_abort:
                     logger.bind(tag=TAG).debug("收到打断信号，跳过当前音频数据")
                     enqueue_text, enqueue_audio = None, []
+                    pending_mqtt_audio_items = []
                     continue
 
-                # 收到下一个文本开始或会话结束时进行上报
-                if sentence_type is not SentenceType.MIDDLE:
-                    if self.report_on_last:
-                        # 累积模式：适用于全程只有一个语音流的TTS（如seed-tts-2.0）
-                        # FIRST时只记录文本，音频持续累积，仅在LAST时统一上报
-                        if text:
-                            enqueue_text = text
-                        if sentence_type == SentenceType.LAST:
-                            enqueue_tts_report(self.conn, enqueue_text, enqueue_audio)
+                if self.conn.conn_from_mqtt_gateway:
+                    pending_mqtt_audio_items.append((sentence_type, audio_datas, text, sentence_id))
+                    if sentence_type != SentenceType.LAST:
+                        continue
+                    audio_items = pending_mqtt_audio_items
+                    pending_mqtt_audio_items = []
+                else:
+                    audio_items = [(sentence_type, audio_datas, text, sentence_id)]
+
+                for sentence_type, audio_datas, text, sentence_id in audio_items:
+                    # 收到下一个文本开始或会话结束时进行上报
+                    if sentence_type is not SentenceType.MIDDLE:
+                        if self.report_on_last:
+                            # 累积模式：适用于全程只有一个语音流的TTS（如seed-tts-2.0）
+                            # FIRST时只记录文本，音频持续累积，仅在LAST时统一上报
+                            if text:
+                                enqueue_text = text
+                            if sentence_type == SentenceType.LAST:
+                                enqueue_tts_report(self.conn, enqueue_text, enqueue_audio)
+                                enqueue_audio = []
+                                enqueue_text = None
+                        else:
+                            # 非累积模式：每个句子分别上报
+                            if enqueue_text is not None:
+                                enqueue_tts_report(self.conn, enqueue_text, enqueue_audio)
                             enqueue_audio = []
-                            enqueue_text = None
-                    else:
-                        # 非累积模式：每个句子分别上报
-                        if enqueue_text is not None:
-                            enqueue_tts_report(self.conn, enqueue_text, enqueue_audio)
-                        enqueue_audio = []
-                        enqueue_text = text
+                            enqueue_text = text
 
-                # 收集上报音频数据
-                if isinstance(audio_datas, bytes):
-                    enqueue_audio.append(audio_datas)
+                    # 收集上报音频数据
+                    if isinstance(audio_datas, bytes):
+                        enqueue_audio.append(audio_datas)
 
-                # 发送音频
-                future = asyncio.run_coroutine_threadsafe(
-                    sendAudioMessage(self.conn, sentence_type, audio_datas, text, sentence_id),
-                    self.conn.loop,
-                )
-                future.result()
+                    # 发送音频
+                    future = asyncio.run_coroutine_threadsafe(
+                        sendAudioMessage(self.conn, sentence_type, audio_datas, text, sentence_id),
+                        self.conn.loop,
+                    )
+                    future.result()
 
-                # 记录输出和报告
-                if self.conn.max_output_size > 0 and text:
-                    add_device_output(self.conn.headers.get("device-id"), len(text))
+                    # 记录输出和报告
+                    if self.conn.max_output_size > 0 and text:
+                        add_device_output(self.conn.headers.get("device-id"), len(text))
 
             except Exception as e:
                 logger.bind(tag=TAG).error(f"audio_play_priority_thread: {text} {e}")
@@ -485,6 +497,26 @@ class TTSProviderBase(ABC):
         full_text = "".join(self.tts_text_buff)
         current_text = full_text[self.processed_chars :]  # 从未处理的位置开始
         last_punct_pos = -1
+
+        if self.conn.conn_from_mqtt_gateway and not self.tts_stop_request:
+            min_segment_chars = int(self.conn.config.get("mqtt_tts_min_segment_chars", 45))
+            if len(current_text) < min_segment_chars:
+                return None
+            for punct in self.punctuations:
+                pos = current_text.rfind(punct)
+                if pos > last_punct_pos:
+                    last_punct_pos = pos
+
+            if last_punct_pos == -1:
+                return None
+
+            segment_text_raw = current_text[: last_punct_pos + 1]
+            segment_text = textUtils.get_string_no_punctuation_or_emoji(
+                segment_text_raw
+            )
+            self.processed_chars += len(segment_text_raw)
+            self.is_first_sentence = False
+            return segment_text
 
         # 根据是否是第一句话选择不同的标点符号集合
         punctuations_to_use = (

@@ -20,7 +20,7 @@ def build_device_topics(topic_prefix: str, device_id: str) -> dict[str, str]:
 
 
 class MqttTransportConnection:
-    def __init__(self, device_id: str, client, topic_prefix: str, json_qos: int = 1, audio_qos: int = 0):
+    def __init__(self, device_id: str, client, topic_prefix: str, json_qos: int = 1, audio_qos: int = 1):
         self.device_id = device_id
         self.client = client
         self.topics = build_device_topics(topic_prefix, device_id)
@@ -53,7 +53,7 @@ class MqttTransportConnection:
             audio_payload = payload if self._valid_audio_packet(payload) and len(payload) >= 16 and payload[0] == 1 else self._pack_audio(payload)
             self.client.publish(self.topics["down_audio"], audio_payload, qos=self.audio_qos)
         else:
-            self.client.publish(self.topics["down_json"], payload, qos=self.json_qos)
+            self.client.publish(self.topics["down_json"], str(payload).encode("utf-8"), qos=self.json_qos)
 
     async def close(self):
         if not self.closed:

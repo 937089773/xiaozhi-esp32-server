@@ -42,7 +42,7 @@ server:
   # UDP网关配置
   udp_gateway: null
 mqtt_transport:
-  enabled: false
+  enabled: true
   endpoint: "p956331a.ala.cn-hangzhou.emqxsl.cn"
   port: 8883
   username: "server-user"
@@ -52,7 +52,7 @@ mqtt_transport:
   tls: true
   qos:
     json: 1
-    audio: 0
+    audio: 1
 log:
   # 设置控制台输出的日志格式，时间、日志级别、标签、消息
   log_format: "<green>{time:YYMMDD HH:mm:ss}</green>[{version}_{selected_module}][<light-blue>{extra[tag]}</light-blue>]-<level>{level}</level>-<light-green>{message}</light-green>"

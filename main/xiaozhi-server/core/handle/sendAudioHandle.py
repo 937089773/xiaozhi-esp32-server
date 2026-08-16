@@ -127,7 +127,10 @@ async def sendAudio(
     if audios is None or len(audios) == 0:
         return
 
-    send_delay = conn.config.get("tts_audio_send_delay", -1) / 1000.0
+    send_delay_ms = conn.config.get("tts_audio_send_delay", -1)
+    if conn.conn_from_mqtt_gateway and send_delay_ms <= 0:
+        send_delay_ms = 20
+    send_delay = send_delay_ms / 1000.0
     is_single_packet = isinstance(audios, bytes)
 
     # 初始化或获取 RateController
@@ -309,7 +312,7 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
         conn.clearSpeakStatus()
 
     # 发送消息到客户端
-    await conn.websocket.send(json.dumps(message))
+    await conn.websocket.send(json.dumps(message, ensure_ascii=False))
 
 
 async def send_stt_message(conn: "ConnectionHandler", text):
@@ -336,7 +339,7 @@ async def send_stt_message(conn: "ConnectionHandler", text):
         display_text = text
     stt_text = textUtils.get_string_no_punctuation_or_emoji(display_text)
     await conn.websocket.send(
-        json.dumps({"type": "stt", "text": stt_text, "session_id": conn.session_id})
+        json.dumps({"type": "stt", "text": stt_text, "session_id": conn.session_id}, ensure_ascii=False)
     )
     await send_tts_message(conn, "start")
     # 发送start消息后客户端状态会处于说话中状态，同步服务端状态
@@ -350,4 +353,4 @@ async def send_display_message(conn: "ConnectionHandler", text):
         "text": text,
         "session_id": conn.session_id
     }
-    await conn.websocket.send(json.dumps(message))
+    await conn.websocket.send(json.dumps(message, ensure_ascii=False))

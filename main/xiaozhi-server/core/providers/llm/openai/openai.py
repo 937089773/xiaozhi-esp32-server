@@ -1,3 +1,5 @@
+import os
+
 import httpx
 import openai
 from openai.types import CompletionUsage
@@ -18,14 +20,35 @@ THINKING_DISABLED_DOMAINS = {
 }
 
 
+def _resolve_config_value(value, default=""):
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        return value
+
+    value = value.strip()
+    if value.startswith("env:"):
+        return os.getenv(value[4:].strip(), default)
+    if value.startswith("${") and value.endswith("}"):
+        env_name = value[2:-1].strip()
+        if ":-" in env_name:
+            env_name, fallback = env_name.split(":-", 1)
+            return os.getenv(env_name.strip(), fallback)
+        return os.getenv(env_name, default)
+    return value
+
+
 class LLMProvider(LLMProviderBase):
     def __init__(self, config):
-        self.model_name = config.get("model_name")
-        self.api_key = config.get("api_key")
+        self.model_name = _resolve_config_value(config.get("model_name"))
+        api_key_env = _resolve_config_value(config.get("api_key_env"))
+        env_api_key = os.getenv(str(api_key_env).strip(), "") if api_key_env else ""
+        config_api_key = _resolve_config_value(config.get("api_key"))
+        self.api_key = env_api_key or config_api_key
         if "base_url" in config:
-            self.base_url = config.get("base_url")
+            self.base_url = _resolve_config_value(config.get("base_url"))
         else:
-            self.base_url = config.get("url")
+            self.base_url = _resolve_config_value(config.get("url"))
         
         timeout_config = config.get("timeout")
         if isinstance(timeout_config, dict):
@@ -65,9 +88,13 @@ class LLMProvider(LLMProviderBase):
             f"意图识别参数初始化: {self.temperature}, {self.max_tokens}, {self.top_p}, {self.frequency_penalty}"
         )
 
-        model_key_msg = check_model_key("LLM", self.api_key)
-        if model_key_msg:
-            logger.bind(tag=TAG).error(model_key_msg)
+        if not self.api_key:
+            key_source = f"环境变量 {api_key_env} 或 api_key" if api_key_env else "api_key"
+            logger.bind(tag=TAG).error(f"配置错误: LLM 的 API key 未设置，请配置 {key_source}")
+        else:
+            model_key_msg = check_model_key("LLM", self.api_key)
+            if model_key_msg:
+                logger.bind(tag=TAG).error(model_key_msg)
         self.client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=custom_timeout)
 
     @staticmethod

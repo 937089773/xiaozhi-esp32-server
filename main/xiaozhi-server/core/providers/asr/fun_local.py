@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import sys
 import time
 import shutil
@@ -56,6 +57,7 @@ class ASRProvider(ASRProviderBase):
         self.output_dir = config.get("output_dir")  # 修正配置键名
         self.language = config.get("language", "auto")
         self.delete_audio_file = delete_audio_file
+        self._validate_model_files()
 
         # 确保输出目录存在
         os.makedirs(self.output_dir, exist_ok=True)
@@ -66,6 +68,39 @@ class ASRProvider(ASRProviderBase):
                 disable_update=True,
                 hub="hf",
                 # device="cuda:0",  # 启用GPU加速
+            )
+
+    def _validate_model_files(self):
+        if not self.model_dir:
+            raise ValueError("FunASR 模型目录未配置")
+
+        config_path = os.path.join(self.model_dir, "configuration.json")
+        if not os.path.isfile(config_path):
+            raise FileNotFoundError(f"FunASR 模型配置不存在: {config_path}")
+
+        with open(config_path, "r", encoding="utf-8") as fp:
+            model_config = json.load(fp)
+
+        file_metas = model_config.get("file_path_metas", {})
+        required_files = []
+        init_param = file_metas.get("init_param")
+        if init_param:
+            required_files.append(init_param)
+        frontend_conf = file_metas.get("frontend_conf", {})
+        cmvn_file = frontend_conf.get("cmvn_file")
+        if cmvn_file:
+            required_files.append(cmvn_file)
+
+        missing_files = [
+            name
+            for name in required_files
+            if not os.path.isfile(os.path.join(self.model_dir, name))
+        ]
+        if missing_files:
+            raise FileNotFoundError(
+                "FunASR 模型文件不完整，缺少: "
+                + ", ".join(missing_files)
+                + "；请先补齐本地 models/SenseVoiceSmall 后再重建 Docker 镜像"
             )
 
     async def speech_to_text(

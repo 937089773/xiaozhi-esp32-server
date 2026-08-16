@@ -31,7 +31,18 @@ def test_send_routes_text_to_down_json_with_json_qos():
     asyncio.run(conn.send('{"type":"hello"}'))
 
     assert client.published == [
-        ("xiaozhi/device/device-001/down/json", '{"type":"hello"}', 1)
+        ("xiaozhi/device/device-001/down/json", b'{"type":"hello"}', 1)
+    ]
+
+
+def test_send_routes_unicode_text_as_utf8_bytes():
+    client = FakeMqttClient()
+    conn = MqttTransportConnection("device-001", client, "xiaozhi/device", json_qos=1, audio_qos=0)
+
+    asyncio.run(conn.send('{"type":"tts","text":"你好"}'))
+
+    assert client.published == [
+        ("xiaozhi/device/device-001/down/json", '{"type":"tts","text":"你好"}'.encode("utf-8"), 1)
     ]
 
 
@@ -47,6 +58,18 @@ def test_send_routes_bytes_to_down_audio_with_audio_qos():
     assert payload[:2] == b"\x01\x00"
     assert struct.unpack("!H", payload[2:4])[0] == 4
     assert struct.unpack("!I", payload[12:16])[0] == 4
+    assert payload[16:] == b"opus"
+
+
+def test_send_routes_bytes_to_down_audio_with_default_audio_qos():
+    client = FakeMqttClient()
+    conn = MqttTransportConnection("device-001", client, "xiaozhi/device")
+
+    asyncio.run(conn.send(b"opus"))
+
+    topic, payload, qos = client.published[0]
+    assert topic == "xiaozhi/device/device-001/down/audio"
+    assert qos == 1
     assert payload[16:] == b"opus"
 
 

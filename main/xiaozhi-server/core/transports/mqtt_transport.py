@@ -14,7 +14,7 @@ class MqttTransport:
         self.server = server
         self.topic_prefix = config.get("topic_prefix", "xiaozhi/device").rstrip("/")
         self.json_qos = int(config.get("qos", {}).get("json", 1))
-        self.audio_qos = int(config.get("qos", {}).get("audio", 0))
+        self.audio_qos = int(config.get("qos", {}).get("audio", 1))
         self.connection_factory = connection_factory
         self.connections = {}
         self.client = None
