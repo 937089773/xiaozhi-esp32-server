@@ -1,0 +1,75 @@
+# Docker安装Server + 本地TTS(IndexTTS2.5)
+
+services:
+  xiaozhi-esp32-server:
+    image: xiaozhi-esp32-server:only-mqtt-local
+    build:
+      context: ../..
+      dockerfile: Dockerfile-server
+    container_name: xiaozhi-esp32-server
+    restart: always
+    security_opt:
+      - seccomp:unconfined
+    depends_on:
+      - indextts-tts
+    environment:
+      TZ: UTC
+      XIAOZHI_LLM_API_KEY: ${XIAOZHI_LLM_API_KEY:-}
+      XIAOZHI_TTS_MODE: local
+      XIAOZHI_TTS_PROVIDER: ${XIAOZHI_TTS_PROVIDER:-CustomTTS}
+      XIAOZHI_TTS_URL: ${XIAOZHI_TTS_URL:-http://indextts-tts:8002/v1/audio/speech}
+      XIAOZHI_TTS_MODEL: ${XIAOZHI_TTS_MODEL:-IndexTeam/IndexTTS-2.5}
+      XIAOZHI_TTS_VOICE: ${XIAOZHI_TTS_VOICE:-voice_01}
+      XIAOZHI_TTS_FORMAT: ${XIAOZHI_TTS_FORMAT:-wav}
+      XIAOZHI_TTS_SPEED: ${XIAOZHI_TTS_SPEED:-1}
+      XIAOZHI_TTS_STREAM: ${XIAOZHI_TTS_STREAM:-false}
+      XIAOZHI_TTS_LANG_CODE: ${XIAOZHI_TTS_LANG_CODE:-ZH}
+    ports:
+      # ws服务端
+      - "8000:8000"
+      # http服务的端口，用于简单OTA接口(单服务部署)，以及视觉分析接口
+      - "8003:8003"
+    volumes:
+      # 配置文件目录
+      - ./data:/opt/xiaozhi-esp32-server/data
+
+  indextts-tts:
+    image: xiaozhi-indextts2.5:local
+    build:
+      context: .
+      dockerfile: docker/indextts2.5/Dockerfile
+      args:
+        INDEXTTS_BASE_IMAGE: ${INDEXTTS_BASE_IMAGE:-nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04}
+        INDEXTTS_REPO: ${INDEXTTS_REPO:-https://github.com/index-tts/index-tts.git}
+        INDEXTTS_REF: ${INDEXTTS_REF:-main}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}
+        UV_DEFAULT_INDEX: ${UV_DEFAULT_INDEX:-https://mirrors.aliyun.com/pypi/simple}
+    container_name: indextts-tts
+    restart: always
+    gpus: all
+    environment:
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      HF_HOME: /opt/index-tts/checkpoints/hf_cache
+      HF_HUB_CACHE: /opt/index-tts/checkpoints/hf_cache
+      HF_HUB_DISABLE_XET: "1"
+      INDEXTTS_MODEL_ID: ${INDEXTTS_MODEL_ID:-IndexTeam/IndexTTS-2.5}
+      INDEXTTS_DOWNLOAD_SOURCE: ${INDEXTTS_DOWNLOAD_SOURCE:-modelscope}
+      INDEXTTS_MODEL_DIR: /opt/index-tts/checkpoints
+      INDEXTTS_DEFAULT_FORMAT: ${XIAOZHI_TTS_FORMAT:-wav}
+      INDEXTTS_DEFAULT_LANG: ${XIAOZHI_TTS_LANG_CODE:-ZH}
+      INDEXTTS_DEFAULT_SPEED: ${XIAOZHI_TTS_SPEED:-1}
+      INDEXTTS_DEFAULT_SPK_AUDIO: ${INDEXTTS_DEFAULT_SPK_AUDIO:-/opt/index-tts/examples/voice_01.wav}
+      INDEXTTS_EXAMPLES_DIR: /opt/index-tts/examples
+      INDEXTTS_VOICE_DIR: /opt/index-tts/voices
+      INDEXTTS_FETCH_EXAMPLES: ${INDEXTTS_FETCH_EXAMPLES:-true}
+      INDEXTTS_USE_BF16: ${INDEXTTS_USE_BF16:-true}
+      INDEXTTS_USE_CUDA_KERNEL: ${INDEXTTS_USE_CUDA_KERNEL:-true}
+      INDEXTTS_USE_QWEN_EMO: ${INDEXTTS_USE_QWEN_EMO:-false}
+    ports:
+      - "${XIAOZHI_LOCAL_TTS_PORT:-8002}:8002"
+    volumes:
+      - indextts-data:/opt/index-tts/checkpoints
+      - ./data/indextts/voices:/opt/index-tts/voices
+
+volumes:
+  indextts-data:
