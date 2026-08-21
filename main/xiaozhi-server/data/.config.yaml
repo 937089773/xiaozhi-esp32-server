@@ -1,0 +1,34 @@
+﻿server:
+  websocket: "ws://192.168.3.2:8000/xiaozhi/v1/"
+  vision_explain: "http://192.168.3.2:8003/mcp/vision/explain"
+mqtt_transport:
+  enabled: true
+  endpoint: "p956331a.ala.cn-hangzhou.emqxsl.cn"
+  port: 8883
+  username: "mqtt"
+  password: "xiaozhi"
+  client_id: "xiaozhi-server"
+  topic_prefix: "xiaozhi/device"
+  tls: true
+  qos:
+    json: 1
+    audio: 0
+mqtt_audio_bundle_frames: 4
+mqtt_audio_bundle_max_bytes: 4096
+mqtt_audio_bundle_flush_ms: 60
+tts_timeout: 15
+tts_max_retries: 2
+mqtt_tts_parallel_enabled: true
+mqtt_tts_parallel_workers: 4
+mqtt_tts_parallel_window: 12
+mqtt_tts_order_timeout: 30
+mqtt_tts_min_segment_chars: 12
+selected_module:
+  LLM: OpenCodeLLM
+LLM:
+  OpenCodeLLM:
+    type: openai
+    base_url: "https://api.deepseek.com"
+    model_name: "deepseek-v4-flash"
+    api_key_env: XIAOZHI_LLM_API_KEY
+    api_key: "sk-a50a166ede9f4c40a97ed393dd3f8cde"
