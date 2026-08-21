@@ -1,6 +1,8 @@
 ﻿server:
-  websocket: "ws://192.168.3.2:8000/xiaozhi/v1/"
-  vision_explain: "http://192.168.3.2:8003/mcp/vision/explain"
+  ip: 0.0.0.0
+  port: 8000
+  http_port: 8003
+  vision_explain: http://你的ip或者域名:端口号/mcp/vision/explain
 mqtt_transport:
   enabled: true
   endpoint: "p956331a.ala.cn-hangzhou.emqxsl.cn"
@@ -24,11 +26,18 @@ mqtt_tts_parallel_window: 12
 mqtt_tts_order_timeout: 30
 mqtt_tts_min_segment_chars: 12
 selected_module:
-  LLM: OpenCodeLLM
+  ASR: SherpaASR
+  LLM: LocalOpenAILLM
+#LLM:
+#  OpenCodeLLM:
+#    type: openai
+#    base_url: "https://api.deepseek.com"
+#    model_name: "deepseek-v4-flash"
+#    api_key_env: XIAOZHI_LLM_API_KEY
+#    api_key: "sk-a50a166ede9f4c40a97ed393dd3f8cde"
 LLM:
-  OpenCodeLLM:
+  LocalOpenAILLM:
     type: openai
-    base_url: "https://api.deepseek.com"
-    model_name: "deepseek-v4-flash"
-    api_key_env: XIAOZHI_LLM_API_KEY
-    api_key: "sk-a50a166ede9f4c40a97ed393dd3f8cde"
+    base_url: http://host.docker.internal:23456/v1
+    model_name: gpt-5.5
+    api_key: dummy
