@@ -1,5 +1,6 @@
 import os
 import asyncio
+import json
 import yaml
 from collections.abc import Mapping
 from config.manage_api_client import (
@@ -145,6 +146,19 @@ def _apply_local_custom_tts_config(tts_configs, environ):
     lang_code = _env_value(environ, "XIAOZHI_TTS_LANG_CODE")
     if lang_code:
         params["lang_code"] = lang_code
+    kwargs_json = _env_value(environ, "XIAOZHI_TTS_KWARGS_JSON")
+    if kwargs_json:
+        params["kwargs"] = _normalize_json_object(kwargs_json, "XIAOZHI_TTS_KWARGS_JSON")
+    else:
+        tts_kwargs = {}
+        language = _env_value(environ, "XIAOZHI_TTS_LANGUAGE")
+        if language:
+            tts_kwargs["language"] = language
+        instruct = _env_value(environ, "XIAOZHI_TTS_INSTRUCT")
+        if instruct:
+            tts_kwargs["instruct"] = instruct
+        if tts_kwargs:
+            params["kwargs"] = json.dumps(tts_kwargs, ensure_ascii=False)
 
     custom_tts.update(
         {
@@ -188,6 +202,16 @@ def _coerce_scalar(value):
         return int(value)
     except ValueError:
         return value
+
+
+def _normalize_json_object(value, key):
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{key} must be a valid JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{key} must be a JSON object")
+    return json.dumps(parsed, ensure_ascii=False)
 
 
 async def get_private_config_from_api(config, device_id, client_id):

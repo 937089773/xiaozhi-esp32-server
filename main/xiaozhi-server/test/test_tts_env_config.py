@@ -67,6 +67,43 @@ def test_tts_mode_online_uses_provider_from_env():
     assert config["selected_module"]["TTS"] == "EdgeTTS"
 
 
+def test_tts_mode_local_applies_custom_kwargs_json_from_env():
+    config = _base_config()
+
+    apply_tts_mode_from_env(
+        config,
+        {
+            "XIAOZHI_TTS_MODE": "local",
+            "XIAOZHI_TTS_MODEL": "qwen3-tts",
+            "XIAOZHI_TTS_VOICE": "Serena",
+            "XIAOZHI_TTS_KWARGS_JSON": '{"language":"chinese","instruct":"自然亲切"}',
+        },
+    )
+
+    custom_tts = config["TTS"]["CustomTTS"]
+    assert custom_tts["params"]["kwargs"] == (
+        '{"language": "chinese", "instruct": "自然亲切"}'
+    )
+
+
+def test_tts_mode_local_builds_kwargs_from_language_env():
+    config = _base_config()
+
+    apply_tts_mode_from_env(
+        config,
+        {
+            "XIAOZHI_TTS_MODE": "local",
+            "XIAOZHI_TTS_LANGUAGE": "chinese",
+            "XIAOZHI_TTS_INSTRUCT": "自然亲切",
+        },
+    )
+
+    custom_tts = config["TTS"]["CustomTTS"]
+    assert custom_tts["params"]["kwargs"] == (
+        '{"language": "chinese", "instruct": "自然亲切"}'
+    )
+
+
 def test_tts_mode_ignores_empty_env():
     config = _base_config()
 

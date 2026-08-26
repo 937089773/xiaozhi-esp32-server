@@ -1,0 +1,37 @@
+# Docker安装Server + Mac本机Qwen3 MLX TTS
+
+services:
+  xiaozhi-esp32-server:
+    image: xiaozhi-esp32-server:only-mqtt-local
+    build:
+      context: ../..
+      dockerfile: Dockerfile-server
+    container_name: xiaozhi-esp32-server
+    restart: always
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      TZ: UTC
+      XIAOZHI_LLM_API_KEY: ${XIAOZHI_LLM_API_KEY:-}
+      XIAOZHI_TTS_MODE: local
+      XIAOZHI_TTS_PROVIDER: ${XIAOZHI_TTS_PROVIDER:-CustomTTS}
+      XIAOZHI_TTS_URL: ${XIAOZHI_TTS_URL:-http://host.docker.internal:9997/v1/audio/speech}
+      XIAOZHI_TTS_MODEL: ${XIAOZHI_TTS_MODEL:-Qwen3-TTS-12Hz-0.6B-CustomVoice}
+      XIAOZHI_TTS_VOICE: ${XIAOZHI_TTS_VOICE:-serena}
+      XIAOZHI_TTS_FORMAT: ${XIAOZHI_TTS_FORMAT:-wav}
+      XIAOZHI_TTS_SPEED: ${XIAOZHI_TTS_SPEED:-1}
+      XIAOZHI_TTS_STREAM: ${XIAOZHI_TTS_STREAM:-false}
+      XIAOZHI_TTS_LANGUAGE: ${XIAOZHI_TTS_LANGUAGE:-chinese}
+      XIAOZHI_TTS_INSTRUCT: ${XIAOZHI_TTS_INSTRUCT:-}
+      XIAOZHI_TTS_KWARGS_JSON: ${XIAOZHI_TTS_KWARGS_JSON:-}
+    ports:
+      # ws服务端
+      - "8000:8000"
+      # http服务的端口，用于简单OTA接口(单服务部署)，以及视觉分析接口
+      - "8003:8003"
+    volumes:
+      # 配置文件目录。使用 named volume 避免 Docker Desktop 对 /opt 工作区 bind mount 的共享限制
+      - xiaozhi-server-data:/opt/xiaozhi-esp32-server/data
+
+volumes:
+  xiaozhi-server-data:
